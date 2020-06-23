@@ -8,17 +8,17 @@
 import Component from 'vue-class-component'
 import { fabric } from 'fabric'
 import { Prop, Watch } from 'vue-property-decorator'
-import IFreedrawPath from './freedraw-path.interface'
 import WhiteboardMixin from './whiteboard.mixin'
 import IPoint from '../../models/geometry/point.interface'
 import GeomUtils from '../../utils/geom.util'
+import IFreehandPath from '../../models/whiteboard/freehand-path.interface'
 
 @Component
 export default class CStaticWhiteboard extends WhiteboardMixin {
   @Prop({
-    default: () => [] as IFreedrawPath[],
+    default: () => [] as IFreehandPath[],
   })
-  paths!: IFreedrawPath[]
+  paths!: IFreehandPath[]
 
   /**
    * On mount, the canvas will be bootstrapped.
@@ -26,7 +26,7 @@ export default class CStaticWhiteboard extends WhiteboardMixin {
   mounted() {
     this.canvas = new fabric.StaticCanvas(this.id, {
       renderOnAddRemove: false,
-      // contains width and height
+      // contains diameter and height
       ...this.scaledDimensions,
       backgroundColor: this.backgroundColor,
     })
@@ -36,14 +36,14 @@ export default class CStaticWhiteboard extends WhiteboardMixin {
 
   /**
    * Converts the paths to polylines which already contain
-   * stroke width and color data. Ready to be plugged into the canvas.
+   * stroke diameter and color data. Ready to be plugged into the canvas.
    */
   get polylines(): fabric.Polyline[] {
     return this.paths.map(
-      ({ color, width }, index) =>
-        new fabric.Polyline(this.scaledAndSmoothenedPaths[index], {
+      ({ color, diameter }, index) =>
+        new fabric.Polyline(this.scaledPaths[index], {
           stroke: color,
-          strokeWidth: width * this.scale,
+          strokeWidth: diameter * this.scale,
           fill: 'transparent',
           strokeLineCap: 'round',
           strokeLineJoin: 'round',
@@ -51,17 +51,23 @@ export default class CStaticWhiteboard extends WhiteboardMixin {
     )
   }
 
-  get scaledAndSmoothenedPaths(): IPoint[][] {
-    return this.paths
-      .map(path => path.points)
-      .map(pointArr => {
-        return pointArr.map(point => GeomUtils.scalePoint(point, this.scale))
-      })
-      .map(scaledPointArr => GeomUtils.smoothenPolyline(scaledPointArr, 2))
+  /**
+   * Getter for transforming the points from the paths received
+   * via the props into scaled paths.
+   */
+  get scaledPaths(): IPoint[][] {
+    return this.paths.map(({ points }) =>
+      points.map(point => GeomUtils.scalePoint(point, this.scale))
+    )
   }
 
+  /**
+   * Overrides the function from the super class; runs when
+   * the dimensions/scaling changed. No need to do anything because
+   * polylines will react and `onPolylinesChange` will go in its stead.
+   */
   didDimensionsChange() {
-    this.renderCanvas()
+    // noop
   }
 
   @Watch('polylines')
@@ -72,6 +78,8 @@ export default class CStaticWhiteboard extends WhiteboardMixin {
   /**
    * To be called whenever theres a change to the dimension,
    * scale, or the paths.
+   *
+   * Clears the entire canvas first before laying out the objects.
    */
   renderCanvas() {
     if (!this.canvas) {

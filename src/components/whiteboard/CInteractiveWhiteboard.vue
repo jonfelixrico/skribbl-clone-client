@@ -11,21 +11,20 @@ import {
   takeUntil,
   exhaustMap,
   filter,
-  auditTime,
   mapTo,
   take,
   map,
+  share,
+  throttleTime,
 } from 'rxjs/operators'
 import WhiteboardMixin from './whiteboard.mixin'
-import { Prop, Watch, Component, Emit } from 'vue-property-decorator'
+import { Prop, Watch, Component } from 'vue-property-decorator'
 import FabricUtils from '../../utils/fabric.util'
 import GeomUtils from '../../utils/geom.util'
-import IFreedrawPath from './freedraw-path.interface'
 import IPoint from '../../models/geometry/point.interface'
-import FreedrawingStatus from './freedrawing-status.enum'
 import shortid from 'shortid'
-import IFreedrawProgress from './freedraw-progress.interface'
-import IFreedrawEvent from './freedraw-event.interface'
+import FreehandStatus from '../../models/whiteboard/freehand-status.enum'
+import IFreehandPath from '../../models/whiteboard/freehand-path.interface'
 
 @Component
 export default class CInteractiveWhiteboard extends WhiteboardMixin {
@@ -37,18 +36,22 @@ export default class CInteractiveWhiteboard extends WhiteboardMixin {
   @Prop({ default: () => true })
   allowDrawing!: boolean
 
-  // width of the brush
+  // diameter of the brush
   @Prop({ default: () => 5 })
-  brushWidth!: number
+  brushDiameter!: number
 
   // color of the brush, in hex
   @Prop({ default: () => '#000000' })
   brushColor!: string
 
+  /**
+   * compiles the brush-related props into one object
+   * and computes the scaled version of the brush diameter.
+   */
   get scaledBrushConfig() {
-    const { brushWidth, brushColor } = this
+    const { brushDiameter, brushColor } = this
     return {
-      width: brushWidth * this.scale,
+      diameter: brushDiameter * this.scale,
       color: brushColor,
     }
   }
@@ -68,6 +71,13 @@ export default class CInteractiveWhiteboard extends WhiteboardMixin {
     this.updatescaledBrushConfig()
   }
 
+  /**
+   * Upon update of any brush-related props, this function
+   * will be executed.
+   *
+   * This function assigns the proper valeus to the fabric.js
+   * canvas' brush.
+   */
   updatescaledBrushConfig() {
     const brush = this.canvas.freeDrawingBrush
 
@@ -75,11 +85,16 @@ export default class CInteractiveWhiteboard extends WhiteboardMixin {
       return
     }
 
-    const { width, color } = this.scaledBrushConfig
+    const { diameter, color } = this.scaledBrushConfig
     brush.color = color
-    brush.width = width
+    brush.width = diameter
   }
 
+  /**
+   * Contains the code which listens to canvas events.
+   * This is also in charge of emitting the component events appropriate
+   * from what we received from the canvas.
+   */
   listenForDrawing() {
     // need to use `any` because of typing confict between rxjs and canvas with regards to the event callback parameter on Object#on
 
@@ -90,74 +105,81 @@ export default class CInteractiveWhiteboard extends WhiteboardMixin {
     const mouseMove$ = fromEvent(canvas, 'mouse:move')
 
     const drawing$ = mouseDown$.pipe(
+      // we'll only listen for them events if drawing is enabled
       filter(() => this.allowDrawing),
       exhaustMap(() => {
+        // this map makes sure that we'll only listen for mouseDown events again if we received a mouseUp event
         const id = shortid()
         return merge(
-          of({ status: FreedrawingStatus.ONGOING, id }),
+          // this code emits that the drawing has started. this is automatically emitted upon mouse click down
+          of({ status: FreehandStatus.STARTED, id }),
+          /*
+           * remember: we've reached this line because we have clicked the LMB.
+           * this event emits mousemove events, for our case, these events would mean that the mouse
+           * has moved while the LMB is held down. this is a stroke in the canvas
+           */
           mouseMove$.pipe(
+            /**
+             * this will never stop until we tell -- in our case, we'll stop listening
+             * for mouseMove events if we received a mouseup event.
+             *
+             * if we have finished drawing (mouse up) and we forgot to terminate this observable
+             * via takeUntil, the exhaustmap will think that we're still drawing in the canvas.
+             *
+             * exhaustmap will only release its hold if all of these three observables have terminated
+             */
             takeUntil(mouseUp$),
-            mapTo({ status: FreedrawingStatus.ONGOING, id })
+            mapTo({ status: FreehandStatus.ONGOING, id })
           ),
-          mouseUp$.pipe(
-            take(1),
-            mapTo({ status: FreedrawingStatus.FINISHED, id })
-          )
+          // mouseup events siginify that the drawing has finished
+          mouseUp$.pipe(take(1), mapTo({ status: FreehandStatus.FINISHED, id }))
         )
       }),
-      auditTime(50),
-      map(
-        data =>
-          ({
-            ...data,
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-            points: canvas.freeDrawingBrush._points as IPoint[],
-          } as IFreedrawProgress)
-      )
+      map(data => {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        const raw = canvas.freeDrawingBrush._points as IPoint[]
+
+        return {
+          ...data,
+          points: GeomUtils.scalePath(raw, 1 / this.scale),
+          color: this.brushColor,
+          diameter: this.brushDiameter,
+        }
+      }),
+      // assurance that the subscribe calls below wont spawn three instances of this big-ass observable
+      share(),
+      // this is to prevent memory leaks. all three subscriptions below will be automatically pruged if this big observable has completed
+      takeUntil(this.unsubscriber)
+    )
+
+    const omitStatus = map<IFreehandPath, IFreehandPath>(
+      ({ points, diameter, color, id }) => ({ points, diameter, color, id })
     )
 
     drawing$
       .pipe(
-        filter(event => event.status === FreedrawingStatus.ONGOING),
-        takeUntil(this.unsubscriber)
+        filter(({ status }) => status === FreehandStatus.STARTED),
+        omitStatus
       )
-      .subscribe(this.emitDrawingOngoing.bind(this))
+      .subscribe(pathData => this.$emit('started', pathData))
 
     drawing$
       .pipe(
-        filter(event => event.status === FreedrawingStatus.FINISHED),
-        takeUntil(this.unsubscriber)
+        filter(({ status }) => status === FreehandStatus.FINISHED),
+        omitStatus
       )
-      .subscribe(event => {
-        this.emitDrawingFinished(event)
+      .subscribe(pathData => {
+        this.$emit('finished', pathData)
         this.canvas.clear()
       })
-  }
 
-  /**
-   * Converts the fabric.js Path into the format of IFreedrawPath.
-   * Automatically scales the points and the brush width into 1.
-   * The resulting IFreedrawPath will be emitted.
-   */
-  @Emit('drawing-finished')
-  emitDrawingFinished(progress: IFreedrawProgress): IFreedrawPath {
-    return this.transformToEvent(progress)
-  }
-
-  @Emit('drawing-ongoing')
-  emitDrawingOngoing(progress: IFreedrawProgress): IFreedrawPath {
-    return this.transformToEvent(progress)
-  }
-
-  transformToEvent(event: IFreedrawProgress): IFreedrawEvent {
-    return {
-      ...event,
-      points: event.points.map(point =>
-        GeomUtils.scalePoint(point, 1 / this.scale)
-      ),
-      color: this.brushColor,
-      width: this.brushWidth,
-    }
+    drawing$
+      .pipe(
+        filter(({ status }) => status === FreehandStatus.ONGOING),
+        omitStatus,
+        throttleTime(150)
+      )
+      .subscribe(pathData => this.$emit('moved', pathData))
   }
 
   mounted() {
